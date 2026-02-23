@@ -1,0 +1,34 @@
+# Build
+build/
+cmake-build-*/
+CLAUDE.md
+.playwright-mcp
+.qtcreator
+docs
+*.o
+*.a
+*.dylib
+*.app
+Makefile
+CMakeCache.txt
+CMakeFiles/
+
+# IDE
+.idea/
+.vscode/
+*.pro.user
+*.swp
+*~
+
+# macOS
+.DS_Store
+*.dSYM/
+
+# Docs (auto-generated)
+docs/agent-*.md
+docs/tasks/*.md
+
+# Qt
+moc_*
+ui_*
+qrc_*

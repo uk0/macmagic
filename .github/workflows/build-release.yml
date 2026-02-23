@@ -1,0 +1,161 @@
+name: Build & Release
+
+on:
+  push:
+    branches: ['*']
+
+permissions:
+  contents: write
+
+env:
+  APP_NAME: MacMagic
+  QT_VERSION: '6.8.2'
+  MACOSX_DEPLOYMENT_TARGET_ARM: '13.0'
+  MACOSX_DEPLOYMENT_TARGET_X86: '12.0'
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - arch: arm64
+            runner: macos-14
+            qt_arch: clang_64
+            deployment_target: '13.0'
+          - arch: x86_64
+            runner: macos-13
+            qt_arch: clang_64
+            deployment_target: '12.0'
+
+    runs-on: ${{ matrix.runner }}
+    name: Build (${{ matrix.arch }})
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: ${{ env.QT_VERSION }}
+          arch: ${{ matrix.qt_arch }}
+          modules: 'qtbase'
+          cache: true
+
+      - name: Install libpcap (already on macOS, ensure headers)
+        run: |
+          # libpcap ships with macOS SDK, just verify
+          ls /usr/include/pcap/pcap.h 2>/dev/null || \
+          ls $(xcrun --show-sdk-path)/usr/include/pcap/pcap.h
+
+      - name: Configure
+        run: |
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_PREFIX_PATH="$Qt6_DIR" \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=${{ matrix.deployment_target }} \
+            -DCMAKE_OSX_ARCHITECTURES=${{ matrix.arch }}
+
+      - name: Build
+        run: cmake --build build --config Release -j$(sysctl -n hw.ncpu)
+
+      - name: Run Tests
+        run: |
+          cd build
+          ctest --output-on-failure -j$(sysctl -n hw.ncpu)
+      - name: Package app bundle
+        run: |
+          cd build
+          # Deploy Qt frameworks into .app
+          macdeployqt ${APP_NAME}.app -verbose=1
+
+          # Fix minimum OS version in Info.plist
+          /usr/libexec/PlistBuddy -c \
+            "Set :LSMinimumSystemVersion ${{ matrix.deployment_target }}" \
+            ${APP_NAME}.app/Contents/Info.plist || \
+          /usr/libexec/PlistBuddy -c \
+            "Add :LSMinimumSystemVersion string ${{ matrix.deployment_target }}" \
+            ${APP_NAME}.app/Contents/Info.plist
+
+      - name: Create DMG
+        run: |
+          brew install create-dmg || true
+
+          DMG_NAME="${APP_NAME}-${{ matrix.arch }}.dmg"
+
+          create-dmg \
+            --volname "${APP_NAME}" \
+            --volicon "build/${APP_NAME}.app/Contents/Resources/appicon.icns" \
+            --window-pos 200 120 \
+            --window-size 600 400 \
+            --icon-size 100 \
+            --icon "${APP_NAME}.app" 175 190 \
+            --app-drop-link 425 190 \
+            --hide-extension "${APP_NAME}.app" \
+            "${DMG_NAME}" \
+            "build/${APP_NAME}.app" \
+          || \
+          hdiutil create -volname "${APP_NAME}" \
+            -srcfolder "build/${APP_NAME}.app" \
+            -ov -format UDZO \
+            "${DMG_NAME}"
+
+          echo "DMG_PATH=${DMG_NAME}" >> $GITHUB_ENV
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.APP_NAME }}-${{ matrix.arch }}
+          path: ${{ env.DMG_PATH }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Generate release info
+        id: release_info
+        run: |
+          SHORT_SHA="${GITHUB_SHA::7}"
+          echo "tag=build-${SHORT_SHA}" >> $GITHUB_OUTPUT
+          echo "name=Build ${SHORT_SHA}" >> $GITHUB_OUTPUT
+
+          # Collect commit messages since last tag (or last 20 commits)
+          LAST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+          if [ -n "$LAST_TAG" ]; then
+            BODY=$(git log ${LAST_TAG}..HEAD --pretty=format:"- %s (%h)" --no-merges)
+          else
+            BODY=$(git log -20 --pretty=format:"- %s (%h)" --no-merges)
+          fi
+
+          # Write to file to preserve newlines
+          cat > release_body.md << 'HEREDOC_END'
+          ## Changes
+          HEREDOC_END
+          echo "$BODY" >> release_body.md
+          echo "" >> release_body.md
+          echo "---" >> release_body.md
+          echo "**Minimum macOS:** 12.0 (x86_64) / 13.0 (Apple Silicon)" >> release_body.md
+          echo "**Qt:** ${{ env.QT_VERSION }}" >> release_body.md
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.release_info.outputs.tag }}
+          name: ${{ steps.release_info.outputs.name }}
+          body_path: release_body.md
+          draft: false
+          prerelease: false
+          files: |
+            artifacts/**/*.dmg
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
